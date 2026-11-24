@@ -1,0 +1,162 @@
+name: twreg-public-tanuki
+
+# Public-repo entry: Tanuki(CEF) + all-in-one egress (VPNGate -> UR -> WARP -> direct).
+# Only 4 inputs: runner count / threads per runner / accounts per thread / upload.
+#
+# Public-repo Variables/Secrets:
+#   Variables: PRIVATE_REPO_ACCESS_KEY (read xbox-cn/twreg_ruyijs), API_BASE_URL (optional)
+#   Secrets  : API_TOKEN (optional), artifact_pass (recommended)
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: "runner count (recommended 256)"
+        required: false
+        default: "1"
+      workers:
+        description: "threads per runner"
+        required: false
+        default: "3"
+      accounts:
+        description: "accounts per thread"
+        required: false
+        default: "15"
+      upload:
+        description: "upload accounts: 1=yes 0=artifact only"
+        required: false
+        default: "1"
+
+concurrency:
+  group: twreg-public-tanuki-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          N: ${{ inputs.runners }}
+        run: |
+          M=$(python3 -c "import json,os;n=max(1,min(256,int(os.environ.get('N') or 1)));print(json.dumps(list(range(n))))")
+          echo "matrix=$M" >> "$GITHUB_OUTPUT"
+
+  reg:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - name: checkout private repo
+        uses: actions/checkout@v4
+        with:
+          repository: xbox-cn/twreg_ruyijs
+          ref: tanuki
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY }}
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "ruyijs>=0.4.1"
+
+      - name: download tanuki runtime (bundled in private repo)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY }}
+        run: |
+          gh release download tanuki-runtime -R xbox-cn/twreg_ruyijs -p tanuki-win64.7z -O tanuki-win64.7z --clobber
+          $dst = Join-Path $env:RUNNER_TEMP "tanuki"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $seven = "C:\Program Files\7-Zip\7z.exe"
+          if (-not (Test-Path $seven)) { choco install 7zip --no-progress -y; $seven = "C:\Program Files\7-Zip\7z.exe" }
+          & $seven x tanuki-win64.7z "-o$dst" -y | Out-Null
+          $exe = Get-ChildItem $dst -Recurse -Filter tanuki-cef.exe | Select-Object -First 1
+          if (-not $exe) { Write-Host "::error::tanuki-cef.exe not found after unzip"; exit 1 }
+          "TANUKI_BIN=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: install OpenVPN (VPNGate)
+        shell: pwsh
+        run: |
+          $exe = 'C:/Program Files/OpenVPN/bin/openvpn.exe'
+          if (Test-Path $exe) { Write-Host "openvpn already installed"; exit 0 }
+          choco install openvpn --no-progress -y
+          if (-not (Test-Path $exe)) { Write-Host "::warning::openvpn install failed; VPNGate stage will be skipped" }
+
+      - name: download ur-socks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY }}
+        run: |
+          gh release download ur-socks -R xbox-cn/twreg_ruyijs -p ur-socks.exe -O ur-socks.exe --clobber
+          ls -lh ur-socks.exe
+
+      - name: register (all-in-one egress)
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EGRESS_CHAIN: "1"
+          WORKERS: ${{ inputs.workers }}
+          ACCOUNTS: ${{ inputs.accounts }}
+          ENABLE_UPLOAD: ${{ inputs.upload }}
+          TANUKI_SESSION_ACCOUNTS: ${{ vars.TANUKI_SESSION_ACCOUNTS || '10' }}
+          MAIL_API_URL: ${{ vars.MAIL_API_URL || 'https://mail.minecraft.fashion' }}
+          MAIL_DOMAINS: "*.jsip.us"
+          API_BASE_URL: ${{ vars.API_BASE_URL || secrets.API_BASE_URL || 'http://192.255.172.250:5000' }}
+          API_TOKEN: ${{ secrets.API_TOKEN || vars.API_TOKEN }}
+          VPNGATE_ATTEMPTS: "2"
+          VPNGATE_TIMEOUT: "25"
+          EGRESS_ROTATE_AFTER: "2"
+        run: |
+          try { tzutil /s "China Standard Time" } catch { Write-Host "tzutil failed: $_" }
+          python run_tanuki.py
+
+      - name: disconnect VPNGate
+        if: always()
+        shell: pwsh
+        run: python vpngate.py --down
+
+      - name: encrypt accounts
+        if: always()
+        shell: bash
+        env:
+          ARTIFACT_PASS: ${{ secrets.artifact_pass }}
+        run: |
+          if [ -d accounts ] && [ -n "$(ls -A accounts 2>/dev/null)" ]; then
+            if [ -n "$ARTIFACT_PASS" ]; then
+              tar -czf accounts.tar.gz accounts 2>/dev/null || true
+              openssl enc -aes-256-cbc -pbkdf2 -salt -in accounts.tar.gz -out accounts.tar.gz.enc -pass "pass:$ARTIFACT_PASS"
+              rm -f accounts.tar.gz
+              echo "encrypted: accounts.tar.gz.enc"
+            else
+              echo "::warning::artifact_pass not set; accounts will not be uploaded (public repo)"
+            fi
+          else
+            echo "no accounts produced"
+          fi
+
+      - name: upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tanuki-public-run${{ matrix.run }}-${{ github.run_id }}
+          path: |
+            accounts.tar.gz.enc
+            vpngate-data/openvpn.log
+            ur-socks-*.log
+          retention-days: 14
+          if-no-files-found: warn
